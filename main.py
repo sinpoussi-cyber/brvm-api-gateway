@@ -98,3 +98,55 @@ def get_companies_list(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
 # Vous pouvez ajouter d'autres endpoints ici au fur et à mesure.
+# (à ajouter à la fin de main.py)
+
+@app.get("/analysis/{symbol}")
+def get_full_analysis(symbol: str, db: Session = Depends(get_db)):
+    """
+    Retourne la dernière analyse complète (cours, technique, fondamentale)
+    pour un symbole donné.
+    """
+    # Normaliser le symbole en majuscules
+    symbol = symbol.upper()
+    
+    query = text("""
+        SELECT 
+            c.symbol, c.name as company_name,
+            hd.trade_date, hd.price,
+            ta.*, -- Sélectionne toutes les colonnes de l'analyse technique
+            (SELECT STRING_AGG(fa.analysis_summary, E'\\n---\\n' ORDER BY fa.report_date DESC) 
+             FROM fundamental_analysis fa 
+             WHERE fa.company_id = c.id) as fundamental_summaries
+        FROM companies c
+        LEFT JOIN historical_data hd ON c.id = hd.company_id
+        LEFT JOIN technical_analysis ta ON hd.id = ta.historical_data_id
+        WHERE c.symbol = :symbol
+        ORDER BY hd.trade_date DESC
+        LIMIT 1;
+    """)
+    
+    try:
+        result = db.execute(query, {"symbol": symbol}).fetchone()
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Symbol not found")
+        
+        # Convertir le résultat en un dictionnaire lisible
+        analysis_data = {
+            "symbol": result.symbol,
+            "company_name": result.company_name,
+            "last_trade_date": result.trade_date,
+            "last_price": result.price,
+            "technical_analysis": {
+                "moving_average_signal": result.mm_decision,
+                "bollinger_bands_signal": result.bollinger_decision,
+                "macd_signal": result.macd_decision,
+                "rsi_signal": result.rsi_decision,
+                "stochastic_signal": result.stochastic_decision
+            },
+            "fundamental_analysis": result.fundamental_summaries or "Aucune analyse fondamentale disponible."
+        }
+        
+        return analysis_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
