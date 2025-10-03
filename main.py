@@ -1,5 +1,5 @@
 # ==============================================================================
-# BRVM API GATEWAY (V0.2 - CONNEXION BASE DE DONNÉES & PREMIERS ENDPOINTS)
+# BRVM API GATEWAY (V0.3 - AJOUT DE L'HISTORIQUE DES PRIX)
 # ==============================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -42,15 +42,11 @@ except Exception as e:
 app = FastAPI(
     title="BRVM Analysis API",
     description="API pour servir les données financières et les analyses de la BRVM.",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 # --- Dépendance pour la gestion de la session DB ---
 def get_db():
-    """
-    Cette fonction s'exécute à chaque requête. Elle ouvre une session
-    de base de données, la fournit à l'endpoint, puis la ferme à la fin.
-    """
     if SessionLocal is None:
         raise HTTPException(status_code=500, detail="La connexion à la base de données n'a pas pu être initialisée.")
     
@@ -64,18 +60,11 @@ def get_db():
 
 @app.get("/")
 def read_root():
-    """
-    Endpoint racine pour vérifier que l'API est en ligne.
-    """
     return {"status": "ok", "message": "Bienvenue sur l'API d'Analyse BRVM !"}
 
 @app.get("/health-check")
 def health_check(db: Session = Depends(get_db)):
-    """
-    Vérifie la connectivité avec la base de données.
-    """
     try:
-        # Exécute une requête simple pour tester la connexion
         db.execute(text("SELECT 1"))
         return {"status": "ok", "database_connection": "successful"}
     except SQLAlchemyError as e:
@@ -83,70 +72,68 @@ def health_check(db: Session = Depends(get_db)):
 
 @app.get("/companies/")
 def get_companies_list(db: Session = Depends(get_db)):
-    """
-    Retourne la liste de toutes les sociétés cotées avec leur symbole et leur nom.
-    """
     try:
         query = text("SELECT symbol, name FROM companies ORDER BY symbol;")
         result = db.execute(query).fetchall()
-        
-        # Convertir le résultat en une liste de dictionnaires
         companies = [{"symbol": row[0], "name": row[1]} for row in result]
-        
         return companies
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
-
-# Vous pouvez ajouter d'autres endpoints ici au fur et à mesure.
-# (à ajouter à la fin de main.py)
 
 @app.get("/analysis/{symbol}")
 def get_full_analysis(symbol: str, db: Session = Depends(get_db)):
     """
     Retourne la dernière analyse complète (cours, technique, fondamentale)
-    pour un symbole donné.
+    et l'historique des 50 derniers jours pour un symbole donné.
     """
-    # Normaliser le symbole en majuscules
     symbol = symbol.upper()
     
     query = text("""
+        WITH ranked_historical_data AS (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY company_id ORDER BY trade_date DESC) as rn
+            FROM historical_data
+        )
         SELECT 
             c.symbol, c.name as company_name,
-            hd.trade_date, hd.price,
-            ta.*, -- Sélectionne toutes les colonnes de l'analyse technique
+            rhd.trade_date, rhd.price,
+            ta.mm_decision, ta.bollinger_decision, ta.macd_decision,
+            ta.rsi_decision, ta.stochastic_decision,
             (SELECT STRING_AGG(fa.analysis_summary, E'\\n---\\n' ORDER BY fa.report_date DESC) 
              FROM fundamental_analysis fa 
              WHERE fa.company_id = c.id) as fundamental_summaries
         FROM companies c
-        LEFT JOIN historical_data hd ON c.id = hd.company_id
-        LEFT JOIN technical_analysis ta ON hd.id = ta.historical_data_id
-        WHERE c.symbol = :symbol
-        ORDER BY hd.trade_date DESC
-        LIMIT 1;
+        LEFT JOIN ranked_historical_data rhd ON c.id = rhd.company_id
+        LEFT JOIN technical_analysis ta ON rhd.id = ta.historical_data_id
+        WHERE c.symbol = :symbol AND (rhd.rn <= 50 OR rhd.rn IS NULL)
+        ORDER BY rhd.trade_date ASC;
     """)
     
     try:
-        result = db.execute(query, {"symbol": symbol}).fetchone()
+        result = db.execute(query, {"symbol": symbol}).fetchall()
         
         if not result:
-            raise HTTPException(status_code=404, detail="Symbol not found")
+            raise HTTPException(status_code=404, detail="Symbol not found or no recent data")
+            
+        price_history = [{"date": row.trade_date.strftime('%Y-%m-%d'), "price": row.price} for row in result if row.trade_date and row.price is not None]
         
-        # Convertir le résultat en un dictionnaire lisible
+        latest_data = result[-1]
+        
         analysis_data = {
-            "symbol": result.symbol,
-            "company_name": result.company_name,
-            "last_trade_date": result.trade_date,
-            "last_price": result.price,
+            "symbol": latest_data.symbol,
+            "company_name": latest_data.company_name,
+            "price_history": price_history,
+            "last_trade_date": latest_data.trade_date.strftime('%Y-%m-%d') if latest_data.trade_date else None,
+            "last_price": latest_data.price,
             "technical_analysis": {
-                "moving_average_signal": result.mm_decision,
-                "bollinger_bands_signal": result.bollinger_decision,
-                "macd_signal": result.macd_decision,
-                "rsi_signal": result.rsi_decision,
-                "stochastic_signal": result.stochastic_decision
+                "moving_average_signal": latest_data.mm_decision,
+                "bollinger_bands_signal": latest_data.bollinger_decision,
+                "macd_signal": latest_data.macd_decision,
+                "rsi_signal": latest_data.rsi_decision,
+                "stochastic_signal": latest_data.stochastic_decision
             },
-            "fundamental_analysis": result.fundamental_summaries or "Aucune analyse fondamentale disponible."
+            "fundamental_analysis": latest_data.fundamental_summaries or "Aucune analyse fondamentale disponible."
         }
         
         return analysis_data
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while fetching analysis: {e}")
