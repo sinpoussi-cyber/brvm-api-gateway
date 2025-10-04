@@ -1,5 +1,5 @@
 # ==============================================================================
-# BRVM API GATEWAY (V0.3 - AJOUT DE L'HISTORIQUE DES PRIX)
+# BRVM API GATEWAY (V0.4 - AJOUT DE L'ENDPOINT SCREENER)
 # ==============================================================================
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -19,16 +19,11 @@ DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
 
-# Vérifier que les variables d'environnement sont bien chargées
 if not all([DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME]):
     print("ERREUR: Une ou plusieurs variables d'environnement de la base de données sont manquantes.")
-    # Dans un contexte de production, vous pourriez vouloir arrêter le script ici
-    # import sys
-    # sys.exit(1)
-
+    
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Créer le "moteur" de connexion à la base de données
 try:
     engine = create_engine(DATABASE_URL)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -42,7 +37,7 @@ except Exception as e:
 app = FastAPI(
     title="BRVM Analysis API",
     description="API pour servir les données financières et les analyses de la BRVM.",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 # --- Dépendance pour la gestion de la session DB ---
@@ -82,10 +77,6 @@ def get_companies_list(db: Session = Depends(get_db)):
 
 @app.get("/analysis/{symbol}")
 def get_full_analysis(symbol: str, db: Session = Depends(get_db)):
-    """
-    Retourne la dernière analyse complète (cours, technique, fondamentale)
-    et l'historique des 50 derniers jours pour un symbole donné.
-    """
     symbol = symbol.upper()
     
     query = text("""
@@ -137,3 +128,52 @@ def get_full_analysis(symbol: str, db: Session = Depends(get_db)):
         return analysis_data
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred while fetching analysis: {e}")
+
+# --- NOUVEL ENDPOINT ---
+@app.get("/screener/")
+def get_market_screener(db: Session = Depends(get_db)):
+    """
+    Retourne les derniers signaux techniques pour toutes les sociétés
+    pour construire un tableau de bord de marché.
+    """
+    query = text("""
+        WITH latest_data AS (
+            SELECT
+                company_id,
+                MAX(trade_date) as last_date
+            FROM historical_data
+            GROUP BY company_id
+        )
+        SELECT
+            c.symbol,
+            c.name,
+            hd.price as last_price,
+            ta.mm_decision,
+            ta.bollinger_decision,
+            ta.macd_decision,
+            ta.rsi_decision,
+            ta.stochastic_decision
+        FROM companies c
+        JOIN latest_data ld ON c.id = ld.company_id
+        JOIN historical_data hd ON ld.company_id = hd.company_id AND ld.last_date = hd.trade_date
+        LEFT JOIN technical_analysis ta ON hd.id = ta.historical_data_id
+        ORDER BY c.symbol;
+    """)
+    
+    try:
+        result = db.execute(query).fetchall()
+        screener_data = [
+            {
+                "symbol": row[0],
+                "name": row[1],
+                "last_price": row[2],
+                "signal_mm": row[3],
+                "signal_bollinger": row[4],
+                "signal_macd": row[5],
+                "signal_rsi": row[6],
+                "signal_stochastic": row[7]
+            } for row in result
+        ]
+        return screener_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
